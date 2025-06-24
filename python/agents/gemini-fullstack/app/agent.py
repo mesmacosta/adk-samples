@@ -14,149 +14,75 @@
 
 import datetime
 import logging
-import re
 from collections.abc import AsyncGenerator
 from typing import Literal
 
 from google.adk.agents import BaseAgent, LlmAgent, LoopAgent, SequentialAgent
-from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.adk.planners import BuiltInPlanner
 from google.adk.tools import google_search
-from google.adk.tools.agent_tool import AgentTool
 from google.genai import types as genai_types
+from google.adk.tools.agent_tool import AgentTool
 from pydantic import BaseModel, Field
 
 from .config import config
 
 
 # --- Structured Output Models ---
-class SearchQuery(BaseModel):
-    """Model representing a specific search query for web search."""
+class Recipe(BaseModel):
+    """Model representing a complete baby food recipe."""
 
-    search_query: str = Field(
-        description="A highly specific and targeted query for web search."
+    title: str = Field(description="The creative and appealing name of the recipe.")
+    description: str = Field(
+        description="A brief, one-sentence summary of the recipe."
+    )
+    ingredients: list[str] = Field(
+        description="A list of all ingredients with precise measurements."
+    )
+    instructions: list[str] = Field(
+        description="Step-by-step preparation and cooking instructions."
+    )
+    age_appropriateness: str = Field(
+        description="The recommended baby age range for this recipe (e.g., '6-8 months')."
     )
 
 
-class Feedback(BaseModel):
-    """Model for providing evaluation feedback on research quality."""
+class FollowUpQuestion(BaseModel):
+    """A specific question to guide recipe improvement using web search."""
+
+    question: str = Field(
+        description="A targeted question for web search to resolve a specific issue with the recipe."
+    )
+
+
+class PediatricianFeedback(BaseModel):
+    """Model for providing evaluation feedback on a baby food recipe."""
 
     grade: Literal["pass", "fail"] = Field(
-        description="Evaluation result. 'pass' if the research is sufficient, 'fail' if it needs revision."
+        description=(
+            "Evaluation result. 'pass' if the recipe is safe, nutritious, and appropriate. "
+            "'fail' if it requires changes."
+        )
     )
     comment: str = Field(
-        description="Detailed explanation of the evaluation, highlighting strengths and/or weaknesses of the research."
+        description=(
+            "Detailed explanation of the evaluation, focusing on safety (e.g., choking hazards), "
+            "nutritional balance, and age-appropriateness. Provide clear reasons for the grade."
+        )
     )
-    follow_up_queries: list[SearchQuery] | None = Field(
+    follow_up_questions: list[FollowUpQuestion] | None = Field(
         default=None,
-        description="A list of specific, targeted follow-up search queries needed to fix research gaps. This should be null or empty if the grade is 'pass'.",
+        description=(
+            "A list of specific questions to ask a search engine to fix the recipe's issues. "
+            "This should be null or empty if the grade is 'pass'."
+        ),
     )
-
-
-# --- Callbacks ---
-def collect_research_sources_callback(callback_context: CallbackContext) -> None:
-    """Collects and organizes web-based research sources and their supported claims from agent events.
-
-    This function processes the agent's `session.events` to extract web source details (URLs,
-    titles, domains from `grounding_chunks`) and associated text segments with confidence scores
-    (from `grounding_supports`). The aggregated source information and a mapping of URLs to short
-    IDs are cumulatively stored in `callback_context.state`.
-
-    Args:
-        callback_context (CallbackContext): The context object providing access to the agent's
-            session events and persistent state.
-    """
-    session = callback_context._invocation_context.session
-    url_to_short_id = callback_context.state.get("url_to_short_id", {})
-    sources = callback_context.state.get("sources", {})
-    id_counter = len(url_to_short_id) + 1
-    for event in session.events:
-        if not (event.grounding_metadata and event.grounding_metadata.grounding_chunks):
-            continue
-        chunks_info = {}
-        for idx, chunk in enumerate(event.grounding_metadata.grounding_chunks):
-            if not chunk.web:
-                continue
-            url = chunk.web.uri
-            title = (
-                chunk.web.title
-                if chunk.web.title != chunk.web.domain
-                else chunk.web.domain
-            )
-            if url not in url_to_short_id:
-                short_id = f"src-{id_counter}"
-                url_to_short_id[url] = short_id
-                sources[short_id] = {
-                    "short_id": short_id,
-                    "title": title,
-                    "url": url,
-                    "domain": chunk.web.domain,
-                    "supported_claims": [],
-                }
-                id_counter += 1
-            chunks_info[idx] = url_to_short_id[url]
-        if event.grounding_metadata.grounding_supports:
-            for support in event.grounding_metadata.grounding_supports:
-                confidence_scores = support.confidence_scores or []
-                chunk_indices = support.grounding_chunk_indices or []
-                for i, chunk_idx in enumerate(chunk_indices):
-                    if chunk_idx in chunks_info:
-                        short_id = chunks_info[chunk_idx]
-                        confidence = (
-                            confidence_scores[i] if i < len(confidence_scores) else 0.5
-                        )
-                        text_segment = support.segment.text if support.segment else ""
-                        sources[short_id]["supported_claims"].append(
-                            {
-                                "text_segment": text_segment,
-                                "confidence": confidence,
-                            }
-                        )
-    callback_context.state["url_to_short_id"] = url_to_short_id
-    callback_context.state["sources"] = sources
-
-
-def citation_replacement_callback(
-    callback_context: CallbackContext,
-) -> genai_types.Content:
-    """Replaces citation tags in a report with Markdown-formatted links.
-
-    Processes 'final_cited_report' from context state, converting tags like
-    `<cite source="src-N"/>` into hyperlinks using source information from
-    `callback_context.state["sources"]`. Also fixes spacing around punctuation.
-
-    Args:
-        callback_context (CallbackContext): Contains the report and source information.
-
-    Returns:
-        genai_types.Content: The processed report with Markdown citation links.
-    """
-    final_report = callback_context.state.get("final_cited_report", "")
-    sources = callback_context.state.get("sources", {})
-
-    def tag_replacer(match: re.Match) -> str:
-        short_id = match.group(1)
-        if not (source_info := sources.get(short_id)):
-            logging.warning(f"Invalid citation tag found and removed: {match.group(0)}")
-            return ""
-        display_text = source_info.get("title", source_info.get("domain", short_id))
-        return f" [{display_text}]({source_info['url']})"
-
-    processed_report = re.sub(
-        r'<cite\s+source\s*=\s*["\']?\s*(src-\d+)\s*["\']?\s*/>',
-        tag_replacer,
-        final_report,
-    )
-    processed_report = re.sub(r"\s+([.,;:])", r"\1", processed_report)
-    callback_context.state["final_report_with_citations"] = processed_report
-    return genai_types.Content(parts=[genai_types.Part(text=processed_report)])
 
 
 # --- Custom Agent for Loop Control ---
 class EscalationChecker(BaseAgent):
-    """Checks research evaluation and escalates to stop the loop if grade is 'pass'."""
+    """Checks the pediatrician's evaluation and escalates to stop the loop if the recipe passes."""
 
     def __init__(self, name: str):
         super().__init__(name=name)
@@ -164,195 +90,148 @@ class EscalationChecker(BaseAgent):
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
-        evaluation_result = ctx.session.state.get("research_evaluation")
+        evaluation_result = ctx.session.state.get("pediatrician_evaluation")
         if evaluation_result and evaluation_result.get("grade") == "pass":
             logging.info(
-                f"[{self.name}] Research evaluation passed. Escalating to stop loop."
+                f"[{self.name}] Recipe evaluation passed. Escalating to stop loop."
             )
             yield Event(author=self.name, actions=EventActions(escalate=True))
         else:
             logging.info(
-                f"[{self.name}] Research evaluation failed or not found. Loop will continue."
+                f"[{self.name}] Recipe evaluation failed or not found. Loop will continue."
             )
-            # Yielding an event without content or actions just lets the flow continue.
             yield Event(author=self.name)
 
 
 # --- AGENT DEFINITIONS ---
-plan_generator = LlmAgent(
-    model=config.worker_model,
-    name="plan_generator",
-    description="Generates a 4-5 line action-oriented research plan, using minimal search only for topic clarification.",
-    instruction=f"""
-    You are a research strategist. Your job is to create a high-level RESEARCH PLAN, not a summary.
-    **RULE: Your output MUST be a bulleted list of 4-5 action-oriented research goals or key questions.**
-    - A good goal starts with a verb like "Analyze," "Identify," "Investigate."
-    - A bad output is a statement of fact like "The event was in April 2024."
-    **TOOL USE IS STRICTLY LIMITED:**
-    Your goal is to create a generic, high-quality plan *without searching*.
-    Only use `google_search` if a topic is ambiguous or time-sensitive and you absolutely cannot create a plan without a key piece of identifying information.
-    You are explicitly forbidden from researching the *content* or *themes* of the topic. That is the next agent's job. Your search is only to identify the subject, not to investigate it.
-    Current date: {datetime.datetime.now().strftime("%Y-%m-%d")}
-    """,
-    tools=[google_search],
-)
 
-
-section_planner = LlmAgent(
+recipe_generator = LlmAgent(
     model=config.worker_model,
-    name="section_planner",
-    description="Breaks down the research plan into a structured markdown outline of report sections.",
+    name="recipe_generator",
+    description="Generates a creative and simple baby food recipe from a list of ingredients.",
     instruction="""
-    You are an expert report architect. Using the research topic and the plan from the 'research_plan' state key, design a logical structure for the final report.
-    Your task is to create a markdown outline with 4-6 distinct sections that cover the topic comprehensively without overlap.
-    You can use any markdown format you prefer, but here's a suggested structure:
-    # Section Name
-    A brief overview of what this section covers
-    Feel free to add subsections or bullet points if needed to better organize the content.
-    Make sure your outline is clear and easy to follow.
-    Do not include a "References" or "Sources" section in your outline. Citations will be handled in-line.
+    You are a creative chef specializing in baby food. Your task is to take a list of one or more ingredients and create a simple, single-serving baby food recipe.
+
+    **RULES:**
+    1.  Your output MUST be a valid JSON object that conforms to the `Recipe` schema.
+    2.  The recipe should be simple, with clear instructions suitable for a beginner cook.
+    3.  Consider common preparation methods for babies, like pureeing, mashing, or steaming.
+    4.  Infer a suitable age range based on the texture and ingredients.
     """,
-    output_key="report_sections",
+    output_schema=Recipe,
+    output_key="current_recipe",
 )
 
-
-section_researcher = LlmAgent(
-    model=config.worker_model,
-    name="section_researcher",
-    description="Performs the crucial first pass of web research.",
-    planner=BuiltInPlanner(
-        thinking_config=genai_types.ThinkingConfig(include_thoughts=True)
-    ),
-    instruction="""
-    You are a diligent and exhaustive researcher. Your task is to perform the initial, broad information gathering for a report.
-    You will be provided with a list of sections in the 'report_sections' state key.
-    For each section where 'research' is marked as 'true', generate a comprehensive list of 4-5 targeted search queries to cover the topic from multiple angles.
-    Execute all of these queries using the 'google_search' tool and synthesize the results into a detailed summary for that section.
-    """,
-    tools=[google_search],
-    output_key="section_research_findings",
-    after_agent_callback=collect_research_sources_callback,
-)
-
-research_evaluator = LlmAgent(
+pediatrician_critic_agent = LlmAgent(
     model=config.critic_model,
-    name="research_evaluator",
-    description="Critically evaluates research and generates follow-up queries.",
+    name="pediatrician_critic_agent",
+    description="Evaluates a baby food recipe for safety, nutritional value, and age-appropriateness.",
     instruction=f"""
-    You are a meticulous quality assurance analyst evaluating the research findings in 'section_research_findings'.
+    You are a board-certified pediatrician and infant nutrition specialist.
+    Your sole task is to critically evaluate the provided baby food recipe from the 'current_recipe' state key.
 
-    **CRITICAL RULES:**
-    1. Assume the given research topic is correct. Do not question or try to verify the subject itself.
-    2. Your ONLY job is to assess the quality, depth, and completeness of the research provided *for that topic*.
-    3. Focus on evaluating: Comprehensiveness of coverage, logical flow and organization, use of credible sources, depth of analysis, and clarity of explanations.
-    4. Do NOT fact-check or question the fundamental premise or timeline of the topic.
-    5. If suggesting follow-up queries, they should dive deeper into the existing topic, not question its validity.
+    **EVALUATION CRITERIA:**
+    1.  **Safety:** Are the ingredients safe for babies? Is the texture and preparation method appropriate to prevent choking hazards for the specified age? (e.g., no honey for infants under 1, grapes must be quartered).
+    2.  **Nutritional Value:** Is the recipe nutritionally balanced? Does it provide key nutrients for a baby's development?
+    3.  **Age Appropriateness:** Is the suggested age range accurate for the ingredients and texture?
 
-    Be very critical about the QUALITY of research. If you find significant gaps in depth or coverage, assign a grade of "fail",
-    write a detailed comment about what's missing, and generate 5-7 specific follow-up queries to fill those gaps.
-    If the research thoroughly covers the topic, grade "pass".
+    **OUTPUT:**
+    - If the recipe is excellent, grade it as "pass".
+    - If you find ANY issues, you MUST grade it as "fail". Provide a detailed `comment` explaining the exact problems.
+    - If the grade is "fail", you MUST provide a list of 2-3 specific `follow_up_questions` for a search engine that would help fix the problems you identified. For example: "How to safely prepare sweet potatoes for a 6 month old baby?" or "Nutritional benefits of avocado in infant diet".
 
     Current date: {datetime.datetime.now().strftime("%Y-%m-%d")}
-    Your response must be a single, raw JSON object validating against the 'Feedback' schema.
+    Your response must be a single, raw JSON object validating against the 'PediatricianFeedback' schema.
     """,
-    output_schema=Feedback,
+    output_schema=PediatricianFeedback,
     disallow_transfer_to_parent=True,
     disallow_transfer_to_peers=True,
-    output_key="research_evaluation",
+    output_key="pediatrician_evaluation",
 )
 
-enhanced_search_executor = LlmAgent(
+recipe_refiner_agent = LlmAgent(
     model=config.worker_model,
-    name="enhanced_search_executor",
-    description="Executes follow-up searches and integrates new findings.",
+    name="recipe_refiner_agent",
+    description="Refines and improves a baby food recipe based on pediatrician feedback and web research.",
     planner=BuiltInPlanner(
         thinking_config=genai_types.ThinkingConfig(include_thoughts=True)
     ),
     instruction="""
-    You are a specialist researcher executing a refinement pass.
-    You have been activated because the previous research was graded as 'fail'.
+    You are a recipe developer tasked with fixing a baby food recipe that failed a pediatric review.
 
-    1.  Review the 'research_evaluation' state key to understand the feedback and required fixes.
-    2.  Execute EVERY query listed in 'follow_up_queries' using the 'google_search' tool.
-    3.  Synthesize the new findings and COMBINE them with the existing information in 'section_research_findings'.
-    4.  Your output MUST be the new, complete, and improved set of research findings.
+    1.  **Review Feedback:** Carefully read the `comment` in the 'pediatrician_evaluation' state key to understand what needs to be fixed.
+    2.  **Research Solutions:** Execute EVERY search query provided in the `follow_up_questions` using the `Google Search` tool to find solutions.
+    3.  **Revise the Recipe:** Using the research findings, rewrite the original recipe from 'current_recipe' to address all the pediatrician's concerns. This may involve changing ingredients, measurements, or instructions.
+    4.  **Output:** Your output MUST be the new, improved, and complete recipe as a single JSON object conforming to the `Recipe` schema.
     """,
     tools=[google_search],
-    output_key="section_research_findings",
-    after_agent_callback=collect_research_sources_callback,
+    output_schema=Recipe,
+    output_key="current_recipe",
 )
 
-report_composer = LlmAgent(
+
+final_recipe_presenter_agent = LlmAgent(
     model=config.critic_model,
-    name="report_composer_with_citations",
+    name="final_recipe_presenter_agent",
     include_contents="none",
-    description="Transforms research data and a markdown outline into a final, cited report.",
+    description="Formats the final, approved recipe into a detailed, user-friendly markdown report.",
     instruction="""
-    Transform the provided data into a polished, professional, and meticulously cited research report.
+    You are a food blogger who specializes in creating beautiful and informative recipe cards for parents.
+    Your task is to take the final, approved recipe data from the 'current_recipe' state key and format it into a clear and appealing markdown report.
 
-    ---
-    ### INPUT DATA
-    *   Research Plan: `{research_plan}`
-    *   Research Findings: `{section_research_findings}`
-    *   Citation Sources: `{sources}`
-    *   Report Structure: `{report_sections}`
+    **REPORT STRUCTURE:**
+    -   Start with the recipe `title` as a main heading (`#`).
+    -   Include the `description` and `age_appropriateness`.
+    -   Use a sub-heading (`##`) for "Ingredients" and list them.
+    -   Use a sub-heading (`##`) for "Instructions" and list the steps.
+    -   Add a "Nutrition Notes" section (`##`) with a brief, helpful summary of the recipe's health benefits for a baby.
+    -   Add a "Safety First!" section (`##`) with a bullet point reminding parents to ensure the texture is appropriate for their baby's age to prevent choking.
 
-    ---
-    ### CRITICAL: Citation System
-    To cite a source, you MUST insert a special citation tag directly after the claim it supports.
-
-    **The only correct format is:** `<cite source="src-ID_NUMBER" />`
-
-    ---
-    ### Final Instructions
-    Generate a comprehensive report using ONLY the `<cite source="src-ID_NUMBER" />` tag system for all citations.
-    The final report must strictly follow the structure provided in the **Report Structure** markdown outline.
-    Do not include a "References" or "Sources" section; all citations must be in-line.
+    Your output should be a single, well-formatted markdown document.
     """,
-    output_key="final_cited_report",
-    after_agent_callback=citation_replacement_callback,
+    output_key="final_recipe_report",
 )
 
-research_pipeline = SequentialAgent(
-    name="research_pipeline",
-    description="Executes a pre-approved research plan. It performs iterative research, evaluation, and composes a final, cited report.",
+recipe_creation_pipeline = SequentialAgent(
+    name="recipe_creation_pipeline",
+    description="Takes an initial recipe, runs it through an iterative refinement loop with a pediatrician critic, and then formats the final, approved recipe.",
     sub_agents=[
-        section_planner,
-        section_researcher,
         LoopAgent(
             name="iterative_refinement_loop",
             max_iterations=config.max_search_iterations,
             sub_agents=[
-                research_evaluator,
+                pediatrician_critic_agent,
                 EscalationChecker(name="escalation_checker"),
-                enhanced_search_executor,
+                recipe_refiner_agent,
             ],
         ),
-        report_composer,
+        final_recipe_presenter_agent,
     ],
 )
 
-interactive_planner_agent = LlmAgent(
-    name="interactive_planner_agent",
+interactive_recipe_agent = LlmAgent(
+    name="interactive_recipe_agent",
     model=config.worker_model,
-    description="The primary research assistant. It collaborates with the user to create a research plan, and then executes it upon approval.",
+    description=(
+        "The primary assistant for creating baby food recipes. It collaborates"
+        " with the user to generate a recipe and then gets it approved before"
+        " finalization."
+    ),
     instruction=f"""
-    You are a research planning assistant. Your primary function is to convert ANY user request into a research plan.
+    You are a friendly and helpful AI assistant for parents, named 'Tiny Tastes'.
+    Your job is to help users create delicious and healthy baby food recipes.
 
-    **CRITICAL RULE: Never answer a question directly or refuse a request.** Your one and only first step is to use the `plan_generator` tool to propose a research plan for the user's topic.
-    If the user asks a question, you MUST immediately call `plan_generator` to create a plan to answer the question.
-
-    Your workflow is:
-    1.  **Plan:** Use `plan_generator` to create a draft plan and present it to the user.
-    2.  **Refine:** Incorporate user feedback until the plan is approved.
-    3.  **Execute:** Once the user gives EXPLICIT approval (e.g., "looks good, run it"), you MUST delegate the task to the `research_pipeline` agent, passing the approved plan.
+    **Workflow:**
+    1.  **Generate Recipe:** When the user gives you a list of ingredients, your *only* first step is to call the `recipe_generator` tool.
+    2.  **Present for Approval:** After the `recipe_generator` tool has run, its output will be in the 'current_recipe' state. Present this recipe to the user for approval. For example: "I've come up with a recipe called '{{current_recipe.title}}'. Does this look good? If so, I can have our AI pediatrician review it."
+    3.  **Execute Refinement:** Once the user gives EXPLICIT approval (e.g., "looks good", "yes please"), you MUST delegate the task to the `recipe_creation_pipeline` agent.
 
     Current date: {datetime.datetime.now().strftime("%Y-%m-%d")}
-    Do not perform any research yourself. Your job is to Plan, Refine, and Delegate.
+    Do not perform any research or evaluation yourself. Your job is to Generate, Present, and Delegate.
     """,
-    sub_agents=[research_pipeline],
-    tools=[AgentTool(plan_generator)],
-    output_key="research_plan",
+    sub_agents=[recipe_creation_pipeline],
+    tools=[AgentTool(recipe_generator)],
+    output_key="initial_recipe",
 )
 
-root_agent = interactive_planner_agent
+root_agent = interactive_recipe_agent

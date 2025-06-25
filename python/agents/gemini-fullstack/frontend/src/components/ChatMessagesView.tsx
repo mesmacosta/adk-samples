@@ -162,7 +162,7 @@ interface AiMessageBubbleProps {
   handleCopy: (text: string, messageId: string) => void;
   copiedMessageId: string | null;
   agent?: string;
-  finalReportWithCitations?: boolean;
+  finalReportContent?: string | boolean; // Updated from finalReportWithCitations
   processedEvents: ProcessedEvent[];
   websiteCount: number;
   isLoading: boolean;
@@ -175,7 +175,7 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
   handleCopy,
   copiedMessageId,
   agent,
-  finalReportWithCitations,
+  finalReportContent, // Updated prop name
   processedEvents,
   websiteCount,
   isLoading,
@@ -184,9 +184,17 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
   const shouldShowTimeline = processedEvents.length > 0;
   
   // Condition for DIRECT DISPLAY (interactive_planner_agent OR final report)
+  // A final report is identified if finalReportContent is a non-empty string (the report itself)
+  // or if it's the old boolean true (though content source is different then).
+  // The new agent ('final_recipe_presenter_agent') will provide a string.
+  // The old agent ('report_composer_with_citations') might set a boolean.
+  const isFinalReport = (typeof finalReportContent === 'string' && finalReportContent.length > 0) ||
+                        (typeof finalReportContent === 'boolean' && finalReportContent === true);
+
   const shouldDisplayDirectly = 
-    agent === "interactive_planner_agent" || 
-    (agent === "report_composer_with_citations" && finalReportWithCitations);
+    agent === "interactive_recipe_agent" || // Changed from interactive_planner_agent
+    (agent === "final_recipe_presenter_agent" && isFinalReport) || // New final report agent
+    (agent === "report_composer_with_citations" && isFinalReport); // Old final report agent
   
   if (shouldDisplayDirectly) {
     // Direct display - show content with copy button, and timeline if available
@@ -281,7 +289,7 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
 };
 
 interface ChatMessagesViewProps {
-  messages: { type: "human" | "ai"; content: string; id: string; agent?: string; finalReportWithCitations?: boolean }[];
+  messages: { type: "human" | "ai"; content: string; id: string; agent?: string; finalReportContent?: string | boolean }[]; // Updated here
   isLoading: boolean;
   scrollAreaRef: React.RefObject<HTMLDivElement | null>;
   onSubmit: (query: string) => void;
@@ -361,7 +369,7 @@ export function ChatMessagesView({
                       handleCopy={handleCopy}
                       copiedMessageId={copiedMessageId}
                       agent={message.agent}
-                      finalReportWithCitations={message.finalReportWithCitations}
+                      finalReportContent={message.finalReportContent} // Updated prop
                       processedEvents={eventsForMessage}
                       // MODIFIED: Pass websiteCount only if it's the last AI message
                       websiteCount={isCurrentMessageTheLastAiMessage ? websiteCount : 0}

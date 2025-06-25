@@ -28,10 +28,10 @@ export function WelcomeScreen({
         {/* Header section of the card */}
         <div className="text-center space-y-4">
           <h1 className="text-4xl font-bold text-white flex items-center justify-center gap-3">
-            ✨ Gemini FullStack - ADK 🚀
+            ✨ Tiny Tastes 🍲
           </h1>
           <p className="text-lg text-neutral-300 max-w-md mx-auto">
-            Turns your questions into comprehensive reports!
+            Tell me some ingredients, and I'll help you create a delicious and healthy baby food recipe!
           </p>
         </div>
 
